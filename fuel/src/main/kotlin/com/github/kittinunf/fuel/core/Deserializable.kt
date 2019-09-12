@@ -172,8 +172,8 @@ fun <T : Any, U : Deserializable<T>> Request.response(deserializable: U): Respon
         .getOrThrow()
 
     // By this time it should have a response, but deserialization might fail
-    return runCatching { Triple(this, rawResponse, Result.Success<T, FuelError>(deserializable.deserialize(rawResponse))) }
-        .recover { error -> Triple(this, rawResponse, Result.Failure<T, FuelError>(FuelError.wrap(error, rawResponse))) }
+    return runCatching { Triple(this, rawResponse, Result.Success(deserializable.deserialize(rawResponse))) }
+        .recover { error -> Triple(this, rawResponse, Result.Failure(FuelError.wrap(error, rawResponse))) }
         .getOrThrow()
 }
 
@@ -238,8 +238,7 @@ suspend fun <T : Any, U : Deserializable<T>> Request.awaitResponse(deserializabl
  */
 suspend fun <T : Any, U : Deserializable<T>> Request.awaitResult(deserializable: U): Result<T, FuelError> {
     val initialResult = suspendable().awaitResult()
-    return initialResult.map { deserializable.deserialize(it) }
-        .mapError <T, Exception, FuelError> { FuelError.wrap(it) }
+    return serializeFor(initialResult, deserializable).map { (_, t) -> t }
 }
 
 /**
@@ -248,7 +247,14 @@ suspend fun <T : Any, U : Deserializable<T>> Request.awaitResult(deserializable:
  */
 suspend fun <T : Any, U : Deserializable<T>> Request.awaitResponseResult(deserializable: U): ResponseResultOf<T> {
     val initialResult = suspendable().awaitResult()
-    return initialResult.map { deserializable.deserialize(it) }
-        .mapError <T, Exception, FuelError> { FuelError.wrap(it) }
-        .let { finalResult -> Triple(this, initialResult.getOrElse(Response.error()), finalResult) }
+    return serializeFor(initialResult, deserializable).let {
+            Triple(this,
+                it.fold({ (response, _) -> response }, { error -> error.response }),
+                it.map { (_, t) -> t }
+            )
+        }
 }
+
+private fun <T : Any, U : Deserializable<T>> serializeFor(result: Result<Response, FuelError>, deserializable: U) =
+    result.map { (it to deserializable.deserialize(it)) }
+        .mapError <Pair<Response, T>, Exception, FuelError> { FuelError.wrap(it, result.getOrElse(Response.error())) }

@@ -1,7 +1,6 @@
 package com.github.kittinunf.fuel.toolbox
 
 import com.github.kittinunf.fuel.core.Client
-import com.github.kittinunf.fuel.core.requests.DefaultBody
 import com.github.kittinunf.fuel.core.FuelError
 import com.github.kittinunf.fuel.core.FuelManager
 import com.github.kittinunf.fuel.core.HeaderName
@@ -9,34 +8,37 @@ import com.github.kittinunf.fuel.core.Headers
 import com.github.kittinunf.fuel.core.Method
 import com.github.kittinunf.fuel.core.Request
 import com.github.kittinunf.fuel.core.Response
+import com.github.kittinunf.fuel.core.requests.DefaultBody
 import com.github.kittinunf.fuel.core.requests.isCancelled
 import com.github.kittinunf.fuel.util.ProgressInputStream
 import com.github.kittinunf.fuel.util.ProgressOutputStream
 import com.github.kittinunf.fuel.util.decode
-import java.io.BufferedInputStream
 import java.io.ByteArrayInputStream
 import java.io.IOException
 import java.io.InputStream
 import java.lang.ref.WeakReference
 import java.net.HttpURLConnection
 import java.net.Proxy
-import java.net.URLConnection
 import javax.net.ssl.HttpsURLConnection
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
 import kotlin.math.max
 
-internal class HttpClient(
+class HttpClient(
     private val proxy: Proxy? = null,
     var useHttpCache: Boolean = true,
-    var decodeContent: Boolean = true
+    var decodeContent: Boolean = true,
+    var hook: Client.Hook
 ) : Client {
     override fun executeRequest(request: Request): Response {
         return try {
             doRequest(request)
-        } catch (exception: Exception) {
-            throw FuelError.wrap(exception, Response(request.url))
+        } catch (ioe: IOException) {
+            hook.httpExchangeFailed(request, ioe)
+            throw FuelError.wrap(ioe, Response(request.url))
+        } catch (interrupted: InterruptedException) {
+            throw FuelError.wrap(interrupted, Response(request.url))
         } finally {
             // As per Android documentation, a connection that is not explicitly disconnected
             // will be pooled and reused!  So, don't close it as we need inputStream later!
@@ -45,7 +47,7 @@ internal class HttpClient(
     }
 
     @Throws(InterruptedException::class)
-    private fun ensureRequestActive(request: Request, connection: HttpURLConnection? = null) {
+    private fun ensureRequestActive(request: Request, connection: HttpURLConnection?) {
         val cancelled = request.isCancelled
         if (!cancelled && !Thread.currentThread().isInterrupted) {
             return
@@ -62,26 +64,34 @@ internal class HttpClient(
     override suspend fun awaitRequest(request: Request): Response = suspendCoroutine { continuation ->
         try {
             continuation.resume(doRequest(request))
-        } catch (exception: Exception) {
-            continuation.resumeWithException(FuelError.wrap(exception, Response(request.url)))
+        } catch (ioe: IOException) {
+            hook.httpExchangeFailed(request, ioe)
+            continuation.resumeWithException(FuelError.wrap(ioe, Response(request.url)))
+        } catch (interrupted: InterruptedException) {
+            continuation.resumeWithException(FuelError.wrap(interrupted, Response(request.url)))
         }
     }
 
-    @Throws
+    @Throws(IOException::class, InterruptedException::class)
     private fun doRequest(request: Request): Response {
-        val connection = establishConnection(request) as HttpURLConnection
+        val connection = establishConnection(request)
         sendRequest(request, connection)
         return retrieveResponse(request, connection)
     }
 
-    @Throws(InterruptedException::class)
+    @Throws(IOException::class, InterruptedException::class)
     private fun sendRequest(request: Request, connection: HttpURLConnection) {
         ensureRequestActive(request, connection)
         connection.apply {
             connectTimeout = max(request.executionOptions.timeoutInMillisecond, 0)
             readTimeout = max(request.executionOptions.timeoutReadInMillisecond, 0)
+
+            if (this is HttpsURLConnection) {
+            	sslSocketFactory = request.executionOptions.socketFactory
+            	hostnameVerifier = request.executionOptions.hostnameVerifier
+            }
+
             requestMethod = HttpClient.coerceMethod(request.method).value
-            doInput = true
             useCaches = request.executionOptions.useHttpCache ?: useHttpCache
             instanceFollowRedirects = false
 
@@ -115,14 +125,21 @@ internal class HttpClient(
                 setRequestProperty("X-HTTP-Method-Override", Method.PATCH.value)
             }
 
+            hook.preConnect(connection, request)
             setDoOutput(connection, request.method)
             setBodyIfDoOutput(connection, request)
         }
+
+        // Ensure that we are connected after this point. Note that getOutputStream above will
+        // also connect and exchange HTTP messages.
+        connection.connect()
     }
 
-    @Throws
+    @Throws(IOException::class, InterruptedException::class)
     private fun retrieveResponse(request: Request, connection: HttpURLConnection): Response {
         ensureRequestActive(request, connection)
+
+        hook.postConnect(request)
 
         val headers = Headers.from(connection.headerFields)
         val transferEncoding = headers[Headers.TRANSFER_ENCODING].flatMap { it.split(',') }.map { it.trim() }
@@ -168,7 +185,7 @@ internal class HttpClient(
             contentLength = -1
         }
 
-        val contentStream = dataStream(connection)?.decode(transferEncoding) ?: ByteArrayInputStream(ByteArray(0))
+        val contentStream = dataStream(request, connection)?.decode(transferEncoding) ?: ByteArrayInputStream(ByteArray(0))
         val inputStream = if (shouldDecode && contentEncoding != null) contentStream.decode(contentEncoding) else contentStream
         val cancellationConnection = WeakReference<HttpURLConnection>(connection)
         val progressStream = ProgressInputStream(
@@ -193,40 +210,16 @@ internal class HttpClient(
         )
     }
 
-    private fun dataStream(connection: HttpURLConnection): InputStream? {
-        return try {
-            try {
-                BufferedInputStream(connection.inputStream)
-            } catch (_: IOException) {
-                // The InputStream SHOULD be closed, but just in case the backing implementation is faulty, this ensures
-                // the InputStream ís actually always closed.
-                try { connection.inputStream?.close() } catch (_: IOException) {}
-
-                connection.errorStream?.let { BufferedInputStream(it) }
-            } finally {
-                // We want the stream to live. Closing the stream is handled by Deserialize
-            }
-        } catch (exception: IOException) {
-            // The ErrorStream SHOULD be closed, but just in case the backing implementation is faulty, this ensures the
-            // ErrorStream ís actually always closed.
-            try { connection.errorStream?.close() } catch (_: IOException) {}
-
-            ByteArrayInputStream(exception.message?.toByteArray() ?: ByteArray(0))
-        } finally {
-            // We want the stream to live. Closing the stream is handled by Deserialize
-        }
+    private fun dataStream(request: Request, connection: HttpURLConnection): InputStream? = try {
+        hook.interpretResponseStream(request, connection.inputStream)?.buffered()
+    } catch (_: IOException) {
+        hook.interpretResponseStream(request, connection.errorStream)?.buffered()
     }
 
-    private fun establishConnection(request: Request): URLConnection {
-        val urlConnection = if (proxy != null) request.url.openConnection(proxy) else request.url.openConnection()
-        return if (request.url.protocol == "https") {
-            (urlConnection as HttpsURLConnection).apply {
-                sslSocketFactory = request.executionOptions.socketFactory
-                hostnameVerifier = request.executionOptions.hostnameVerifier
-            }
-        } else {
-            urlConnection as HttpURLConnection
-        }
+    private fun establishConnection(request: Request): HttpURLConnection {
+        val url = request.url
+        val connection = proxy?.let { url.openConnection(it) } ?: url.openConnection()
+        return connection as HttpURLConnection
     }
 
     private fun setBodyIfDoOutput(connection: HttpURLConnection, request: Request) {
@@ -244,11 +237,16 @@ internal class HttpClient(
             connection.setChunkedStreamingMode(4096)
         }
 
-        val totalBytes = if ((contentLength ?: -1L).toLong() > 0) { contentLength!!.toLong() } else { null }
+        val noProgressHandler = request.executionOptions.requestProgress.isNotSet()
+        val outputStream = if (noProgressHandler) {
+            // No need to report progress, let's just send the payload without buffering
+            connection.outputStream
+        } else {
+            // The input and output streams returned by connection are not buffered. In order to give consistent progress
+            // reporting, by means of flushing, the output stream here is buffered.
 
-        // The input and output streams returned by connection are not buffered. In order to give consistent progress
-        // reporting, by means of flushing, the output stream here is buffered.
-        body.writeTo(
+            val totalBytes = if ((contentLength ?: -1L).toLong() > 0) { contentLength!!.toLong() } else { null }
+
             ProgressOutputStream(
                 connection.outputStream,
                 onProgress = { writtenBytes ->
@@ -256,7 +254,9 @@ internal class HttpClient(
                     ensureRequestActive(request, connection)
                 }
             ).buffered(FuelManager.progressBufferSize)
-        )
+        }
+
+        body.writeTo(outputStream)
 
         connection.outputStream.flush()
     }
